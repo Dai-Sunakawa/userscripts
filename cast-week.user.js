@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         カフェるん キャストの今週の出勤
 // @namespace    https://shop.caferun.jp/cast-week
-// @version      1.0.0
+// @version      1.0.1
 // @description  キャストページに、その子の今日から7日分の出勤予定（出勤日・時間）を表示します
 // @match        https://shop.caferun.jp/shop/*/cast/*
 // @run-at       document-idle
@@ -20,6 +20,7 @@
   const SHOP_ID = pm[1];
   const CAST_ID = pm[2];
   const ORIGIN = location.origin;
+  const VERSION = '1.0.1';
   const DAYS = 7;
   const CACHE_MIN = 5;
   const NET_PARALLEL = 2;
@@ -270,7 +271,7 @@
             <div class="mk"><span class="ld"></span></div><div class="tm"></div>
           </a>`).join('')}
         </div>
-        <div class="ft">● 出勤　－ 休み　？ 未定（カフェるんの出勤表から）・日付をタップでその日の出勤一覧</div>
+        <div class="ft">● 出勤　－ 休み　？ 未定（カフェるんの出勤表から）・日付をタップでその日の出勤一覧・v${VERSION}</div>
       </div>`;
     const cell = (i) => root.querySelector(`.d[data-i="${i}"]`);
     const draw = (d, r) => {
@@ -297,7 +298,9 @@
     }));
     const on = results.filter((r) => r && r.state === 'on').length;
     const und = results.filter((r) => r && r.state === 'undecided').length;
-    root.querySelector('.sum').innerHTML = `7日間で <strong>${on}</strong>日出勤${und ? `（未定${und}日）` : ''}`;
+    const nextIdx = results.findIndex((r) => r && r.state === 'on');
+    const next = nextIdx < 0 ? '' : nextIdx === 0 ? '・今日出勤' : `・次は${days[nextIdx].md}(${WD[days[nextIdx].wd]})`;
+    root.querySelector('.sum').innerHTML = `7日間で <strong>${on}</strong>日出勤${und ? `（未定${und}日）` : ''}${next}`;
   }
 
   main();
