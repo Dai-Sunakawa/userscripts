@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         カフェるん「カワいいね!」連続実行（実行→閉じる→次のタブ）
 // @namespace    https://shop.caferun.jp/sunadai
-// @version      0.4.0
-// @description  /member/keep/cast/ に「実行」ボタンを表示。押すと「カワいいね!」ボタンだけを順に押して2秒後にタブを閉じ、次に表示されたタブでも自動で同じ処理を繰り返す。「カワいいね!」を検知できないタブに来たら停止
-// @match        https://shop.caferun.jp/member/keep/cast/*
+// @version      0.5.0
+// @description  shop.caferun.jp の全ページで有効。「カワいいね!」ボタンがあるページに「実行」ボタンを表示し、押すと「カワいいね!」だけを順に押して2秒後にタブを閉じ、次に表示されたタブでも自動で繰り返す。「カワいいね!」を検知できないタブに来たら停止
+// @match        https://shop.caferun.jp/*
 // @run-at       document-idle
 // @grant        window.close
 // @grant        GM_getValue
@@ -185,6 +185,7 @@
   let runner = null;
   function setRunnerText(text, disabled) {
     if (!runner) return;
+    runner.style.display = '';
     runner.textContent = text;
     runner.disabled = !!disabled;
     runner.style.opacity = disabled ? '0.7' : '1';
@@ -194,6 +195,7 @@
   function refreshRunnerCount() {
     if (!runner || running || autoTriggered || runner.disabled) return;
     const n = findButtons().length;
+    if (n === 0) { runner.style.display = 'none'; return; }   // 「カワいいね!」が無いページでは実行ボタンを出さない
     setRunnerText(`▶ カワいいね! 実行（${n}件）→ 閉じて次のタブへ`, false);
   }
 
