@@ -15,7 +15,7 @@
 
 | スクリプト | できること | インストール |
 |---|---|---|
-| 出勤まとめ | 隣人部。とみくすろいどの出勤を1画面で表示（日別・1週間）／★推しの出勤日とGoogleカレンダー追加／来店日を選ぶと誰に何回会えるか／沖縄のカワいいね！ランキング | [インストール](https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/caferun-shukkin.user.js) |
+| 出勤まとめ | 隣人部。とみくすろいどの出勤を1画面で表示（日別・1週間）／★推しの出勤日とGoogleカレンダー追加／来店日を選ぶと誰に何回会えるか／沖縄のカワいいね！ランキング（ボタンを押すと集計） | [インストール](https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/caferun-shukkin.user.js) |
 | カワいいね！増え方メモ | キャストページを開くたびにカワいいね！の数を記録して、前回からの増加と1日あたりのペースを表示 | [インストール](https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/kawaii-memo.user.js) |
 | キャストの今週の出勤 | キャストページに、その子の今日から7日分の出勤日（わかれば時間も）を表示 | [インストール](https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/cast-week.user.js) |
 

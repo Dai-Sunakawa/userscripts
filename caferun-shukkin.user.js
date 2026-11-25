@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         カフェるん 出勤まとめ（隣人部。×みくすろいど）＋推し＋ランキング
 // @namespace    https://shop.caferun.jp/
-// @version      1.3.1
+// @version      1.3.2
 // @description  カフェるんで隣人部。とみくすろいどの出勤を1画面に表示（日別／1週間）、★推しの出勤日とGoogleカレンダー追加、来店日を選ぶと誰に何回会えるか、沖縄のカワいいね！ランキング
 // @match        https://shop.caferun.jp/*
 // @run-at       document-idle
@@ -30,8 +30,8 @@
   const WEEK_PARALLEL = 4;     // 1週間/推しモードで同時に読み込むページ数
   // ランキングの対象（カフェるんの「沖縄・那覇」一覧。2ページ目以降は自動でたどる）
   const RANK_AREAS = ['/shop_search/area_7/mid_area_36/'];
-  const RANK_CACHE_HOURS = 6;  // ランキングを再集計せず使い回す時間
-  const RANK_PARALLEL = 3;     // ランキング集計で同時に読み込む店舗数
+  const RANK_CACHE_HOURS = 24; // これより古い集計には「古いかも」と表示
+  const RANK_PARALLEL = 1;     // ランキング集計は1店ずつ（ほかの表示を優先するため）
   const OTHER_SHOP_COLOR = '#8e7cc3'; // 上の2店以外の推しの色
   const NET_PARALLEL = 2;      // カフェるんへの同時アクセス数（混雑で弾かれないよう控えめ）
   const NET_GAP_MS = 300;      // アクセスの最小間隔(ミリ秒)
@@ -106,6 +106,7 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const netQ = { hi: [], lo: [] };
   let netActive = 0;
+  let netActiveLo = 0; // ランキング集計の同時アクセスは1つまで（表示用に必ず1つ空けておく）
   let netLast = 0;
   let netTimer = null;
   function politeFetch(url, low) {
@@ -115,17 +116,28 @@
     });
   }
   function netPump() {
-    while (netActive < NET_PARALLEL && (netQ.hi.length || netQ.lo.length)) {
+    while (netActive < NET_PARALLEL) {
+      const canLo = netQ.lo.length > 0 && netActiveLo < 1;
+      if (!netQ.hi.length && !canLo) return;
       const wait = netLast + NET_GAP_MS - Date.now();
       if (wait > 0) {
         if (!netTimer) netTimer = setTimeout(() => { netTimer = null; netLast = Date.now() - NET_GAP_MS; netPump(); }, wait);
         return;
       }
-      const job = netQ.hi.length ? netQ.hi.shift() : netQ.lo.shift(); // ランキング集計より表示用を優先
+      const isLo = !netQ.hi.length; // ランキング集計より表示用を優先
+      const job = isLo ? netQ.lo.shift() : netQ.hi.shift();
       netActive++;
+      if (isLo) netActiveLo++;
       netLast = Date.now();
-      fetchRetry(job.url).then(job.resolve, job.reject).finally(() => { netActive--; netPump(); });
+      fetchRetry(job.url).then(job.resolve, job.reject).finally(() => {
+        netActive--;
+        if (isLo) netActiveLo--;
+        netPump();
+      });
     }
+  }
+  function netDropLow() { // 待ち行列に残っている集計用アクセスを取り消す
+    netQ.lo.splice(0).forEach((j) => j.reject(new Error('cancelled')));
   }
   async function fetchRetry(url) {
     for (let i = 0; ; i++) {
@@ -442,6 +454,8 @@
   let rankData = null;
   let rankJob = null;
   let rankProgress = null;
+  let rankLastProgress = null;
+  let rankCancelled = false;
   let rankLimit = 100;
   let rankQuery = '';
   let rankFavOnly = false;
@@ -450,7 +464,7 @@
   function rankCacheGet() {
     try {
       const o = JSON.parse(localStorage.getItem(RANK_KEY) || 'null');
-      if (o && Date.now() - o.t < RANK_CACHE_HOURS * 36e5) return o;
+      if (o && Array.isArray(o.casts)) return o;
     } catch (_) { /* noop */ }
     return null;
   }
@@ -486,6 +500,7 @@
       let url = new URL(path, ORIGIN).href;
       const seen = new Set();
       while (url && !seen.has(url) && seen.size < 20) {
+        if (rankCancelled) throw new Error('cancelled');
         seen.add(url);
         onProgress({ phase: 'list', page: seen.size });
         const res = await politeFetch(url, true);
@@ -513,6 +528,7 @@
     let done = 0;
     let okShops = 0;
     await runPool(list.map((s) => async () => {
+      if (rankCancelled) return;
       try {
         const url = `${ORIGIN}/shop/${s.id}/castlist/`;
         const res = await politeFetch(url, true);
@@ -534,6 +550,7 @@
       } catch (_) { /* その店は飛ばす */ }
       onProgress({ phase: 'shop', done: ++done, total: list.length });
     }), RANK_PARALLEL);
+    if (rankCancelled) throw new Error('cancelled');
 
     // 重複除去（同じ店が旧IDでも載っていることがあるため、名前＋店名でもまとめる）
     const byId = new Map();
@@ -554,16 +571,28 @@
     return o;
   }
 
-  function getRank(force) {
-    if (!force) {
-      const c = rankData || rankCacheGet();
-      if (c) return Promise.resolve(c);
-    }
-    if (!rankJob) {
-      rankJob = crawlRank((p) => rankProgress && rankProgress(p))
-        .finally(() => { rankJob = null; });
-    }
-    return rankJob;
+  // 集計は「集計する」ボタンを押したときだけ動く（ほかのタブに移っても裏で続く）
+  function startRank() {
+    if (rankJob) return;
+    rankCancelled = false;
+    rankLastProgress = null;
+    rankJob = crawlRank((p) => { rankLastProgress = p; if (rankProgress) rankProgress(p); })
+      .then((o) => { rankData = o; return o; })
+      .finally(() => { rankJob = null; });
+    rankJob
+      .then(() => { if (mode === 'rank' && ov.classList.contains('open')) renderRank(); })
+      .catch((err) => {
+        if (mode !== 'rank') return;
+        if (err && err.message === 'cancelled') { renderRank(); return; }
+        renderRank();
+        const rl = bodyEl.querySelector('.rl');
+        if (rl) rl.insertAdjacentHTML('afterbegin', `<div class="msg">集計できませんでした（${esc(err && err.message || err)}）</div>`);
+      });
+  }
+  function cancelRank() {
+    if (!rankJob) return;
+    rankCancelled = true;
+    netDropLow();
   }
 
   async function runPool(tasks, limit) {
@@ -743,7 +772,9 @@
   .flt { display: flex; gap: 6px; margin: 8px 0 6px; flex-wrap: wrap; }
   .fchip { border: 1px solid var(--line); background: var(--bg); color: var(--sub); border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12px; cursor: pointer; }
   .fchip.on { background: var(--fg); color: var(--bg); border-color: var(--fg); font-weight: 700; }
-  .rk-top .sum { margin: 0; font-size: 11px; }
+  .rk-top .sum { margin: 0; font-size: 11px; flex: 1; }
+  .strow { display: flex; align-items: center; gap: 8px; }
+  .strow .fchip { flex: 0 0 auto; }
   .rr { display: flex; align-items: center; gap: 8px; padding: 7px 4px 7px 6px; border-bottom: 1px solid var(--line); }
   .rr.mine { border-left: 4px solid var(--c); padding-left: 4px; }
   .rn { width: 30px; text-align: center; font-weight: 800; font-size: 14px; color: var(--sub); flex: 0 0 auto; }
@@ -885,6 +916,14 @@
       bodyEl.querySelectorAll('.chip').forEach((c) => c.classList.toggle('hl', hl.has(c.dataset.ck)));
       return;
     }
+    if (t.closest && t.closest('.rk-run')) { startRank(); renderRank(); return; }
+    if (t.closest && t.closest('.rk-stop')) {
+      cancelRank();
+      const b = t.closest('.rk-stop');
+      b.disabled = true;
+      b.textContent = '中止しています…';
+      return;
+    }
     const vday = t.closest && t.closest('.vday');
     if (vday) {
       const iso = vday.dataset.iso;
@@ -969,7 +1008,7 @@
     bodyEl.scrollTop = 0;
     if (mode === 'week') renderWeek(force);
     else if (mode === 'oshi') renderOshi(force);
-    else if (mode === 'rank') renderRank(force);
+    else if (mode === 'rank') renderRank();
     else if (mode === 'visit') renderVisit(force);
     else render(current, force);
   }
@@ -1284,8 +1323,16 @@
   }
 
   // ---------- ランキングモード ----------
-  function renderRank(force) {
+  const rankProgressText = (p) => {
+    if (!p) return '準備中…';
+    return p.phase === 'list'
+      ? `店舗一覧を読み込み中…（${p.page}ページ目）`
+      : `キャスト情報を集計中… ${p.done}/${p.total}店`;
+  };
+
+  function renderRank() {
     const my = ++token;
+    if (!rankData) rankData = rankCacheGet();
     bodyEl.innerHTML = `
       <div class="rk-top">
         <input class="q" type="search" placeholder="名前・店名で絞り込み" enterkeyhint="search">
@@ -1293,25 +1340,33 @@
           <button type="button" class="fchip ${rankNoGirls ? 'on' : ''}" data-f="ng">ガールズバーを除く</button>
           <button type="button" class="fchip ${rankFavOnly ? 'on' : ''}" data-f="fav">★推しだけ</button>
         </div>
-        <p class="sum st">カワいいね！の数で並べた沖縄のキャストランキング</p>
+        <div class="strow"><p class="sum st">カワいいね！の数で並べた沖縄のキャストランキング</p>
+          ${rankJob || !rankData ? '' : '<button type="button" class="fchip rk-run">集計し直す</button>'}</div>
       </div>
-      <div class="rl"><div class="msg"><span class="ld"></span><span class="pg">準備中…</span></div></div>`;
+      <div class="rk-prog"></div>
+      <div class="rl"></div>`;
     const q = bodyEl.querySelector('.q');
     q.value = rankQuery;
     q.addEventListener('input', () => { rankQuery = q.value; rankLimit = 100; drawRankList(); });
-    rankProgress = (p) => {
-      const pg = my === token && bodyEl.querySelector('.pg');
-      if (!pg) return;
-      pg.textContent = p.phase === 'list'
-        ? `店舗一覧を読み込み中…（${p.page}ページ目）`
-        : `キャスト情報を集計中… ${p.done}/${p.total}店（初回は1分ほど）`;
-    };
-    getRank(force)
-      .then((o) => { rankData = o; if (my === token) drawRankList(); })
-      .catch((err) => {
-        if (my !== token) return;
-        bodyEl.querySelector('.rl').innerHTML = `<div class="msg">集計できませんでした（${esc(err && err.message || err)}）<br>↻ で再試行できます</div>`;
-      });
+
+    if (rankJob) {
+      bodyEl.querySelector('.rk-prog').innerHTML = `
+        <div class="msg"><span class="ld"></span><span class="pg">${esc(rankProgressText(rankLastProgress))}</span><br>
+          <small>1〜2分かかります。集計中もほかのタブは使えます</small><br>
+          <button type="button" class="btn rk-stop" style="margin-top:10px">中止</button></div>`;
+      rankProgress = (p) => {
+        const pg = my === token && bodyEl.querySelector('.pg');
+        if (pg) pg.textContent = rankProgressText(p);
+      };
+    }
+    if (rankData) {
+      drawRankList();
+    } else if (!rankJob) {
+      bodyEl.querySelector('.rl').innerHTML = `
+        <div class="msg">沖縄・那覇の店（約55店）のキャスト全員の「カワいいね！」を集めて、ランキングにします。<br>
+          <small>1〜2分かかります。集計中もほかのタブは使えます</small><br>
+          <button type="button" class="btn rk-run" style="margin-top:12px;padding:10px 22px;font-weight:700">ランキングを集計する</button></div>`;
+    }
   }
 
   function drawRankList() {
@@ -1330,7 +1385,8 @@
     const q = norm(rankQuery).toLowerCase();
     if (q) view = view.filter(({ c }) => `${c.name} ${c.shopName}`.toLowerCase().includes(q));
     if (rankFavOnly) view = view.filter(({ c }) => isFav(`${c.shopId}:${c.id}`));
-    st.textContent = `集計 ${fmtTime(o.t)}・${o.shops}店・${list.length}人（カワいいね！の数順／↻で再集計）`;
+    const old = Date.now() - o.t > RANK_CACHE_HOURS * 36e5 ? '・少し古いかも' : '';
+    st.textContent = `集計 ${fmtTime(o.t)}・${o.shops}店・${list.length}人${old}（カワいいね！の数順）`;
     if (!view.length) {
       rl.innerHTML = `<div class="msg">${rankFavOnly ? 'ランキング内に★推しがいません' : '該当するキャストがいません'}</div>`;
       return;
