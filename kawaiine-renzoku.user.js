@@ -1,239 +1,318 @@
 // ==UserScript==
-// @name         カフェるん「カワいいね!」連続実行（実行→閉じる→次のタブ）
+// @name         カフェるん タブ複製
 // @namespace    https://shop.caferun.jp/sunadai
-// @version      0.5.0
-// @description  shop.caferun.jp の全ページで有効。「カワいいね!」ボタンがあるページに「実行」ボタンを表示し、押すと「カワいいね!」だけを順に押して2秒後にタブを閉じ、次に表示されたタブでも自動で繰り返す。「カワいいね!」を検知できないタブに来たら停止
+// @version      1.0.0
+// @description  カフェるんのページを、決めたタブ数になるまで10タブずつ1分おきに複製して開きます。タブを開くだけで、ページ内のボタンは押しません
 // @match        https://shop.caferun.jp/*
 // @run-at       document-idle
-// @grant        window.close
+// @grant        GM_openInTab
+// @grant        GM.openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_deleteValue
-// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @noframes
-// @updateURL    https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/kawaiine-renzoku.user.js
-// @downloadURL  https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/kawaiine-renzoku.user.js
+// @homepageURL  https://github.com/Dai-Sunakawa/userscripts
+// @updateURL    https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/caferun-tab-fukusei.user.js
+// @downloadURL  https://raw.githubusercontent.com/Dai-Sunakawa/userscripts/main/caferun-tab-fukusei.user.js
 // ==/UserScript==
+
+// ※このファイルは旧「カワいいね！連続実行」を入れている端末を、自動更新で「タブ複製」に切り替えるためのものです。
+//   新しく入れるときは caferun-tab-fukusei.user.js を使ってください。次回からの更新はそちらから届きます。
 
 (function () {
   'use strict';
 
   // ---- 設定 ----
-  const CLOSE_DELAY_MS    = 2000;          // 最後のクリック後にタブを閉じるまでの待ち時間
-  const CLICK_INTERVAL_MS = 300;           // 複数ボタンを押すときの間隔（同時送信を避ける）
-  const FIND_TIMEOUT_MS   = 8000;          // 自動実行時、ボタンが描画されるのを待つ上限。超えたら「検知できず」として連続実行を停止
-  const CHAIN_TTL_MS      = 5 * 60 * 1000; // 連続実行モードの有効期限（実行ボタンを押してから5分で自動解除）
-  const RELOAD_GUARD_MS   = 60 * 1000;     // クリック直後にこのタブが再読み込みされた場合、再クリックせず閉じるだけにする猶予
-  const CHAIN_KEY         = 'kawaiine_chain_started_at';   // タブ間で共有（Tampermonkey ストレージ）
-  const RELOAD_KEY        = 'kawaiine_clicked_at';         // このタブだけ（sessionStorage）
-  const RUNNER_ATTR       = 'data-kawaiine-runner';
+  const BATCH_SIZE     = 10;          // 1回に開くタブ数
+  const BATCH_GAP_MS   = 60 * 1000;   // 回と回の間隔（前の回を始めてから1分）
+  const OPEN_GAP_MS    = 400;         // 同じ回の中でタブを開く間隔（一度に開いて固まらないように）
+  const MAX_TARGET     = 300;         // 目標タブ数の上限（入れすぎ防止）
+  const DEFAULT_TARGET = 10;
+  const ORIGIN         = 'https://shop.caferun.jp';
+  const JOB_KEY        = 'kt3dup_job';          // このタブの sessionStorage（再読み込みしても続きから）
+  const LAST_TARGET_KEY = 'kt3dup_last_target'; // 前回の目標タブ数
 
-  // ボタンの表示文字: 「カワいいね!」「かわいいね！」+ 任意でハート記号と件数、それ以外の文字が付くものは対象外
-  // 例) 「カワいいね!♥208」→ 対象 / 「カワいいねランキング」「カワいいねを押すと…」→ 対象外
-  const LABEL_RE = /^(カワ|かわ)いいね[!！]?[^\p{L}\p{N}]{0,3}[\d,]{0,8}$/u;
+  const log = (...a) => console.log('[caferun-tab-fukusei]', ...a);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // 「ボタンらしい要素」だけを候補にする（見出し・説明文・ナビの文字列は拾わない）
-  const CLICKABLE_SELECTOR = [
-    'button',
-    'input[type="button"]',
-    'input[type="submit"]',
-    'a',
-    '[role="button"]',
-    '[onclick]',
-    '[class*="btn"]',
-    '[class*="button"]',
-    '[class*="like"]',
-    '[class*="iine"]',
-    '[class*="kawaii"]',
-  ].join(', ');
-
-  // この中にある要素は押さない（サイトのヘッダー・ナビ・フッター）
-  const EXCLUDE_ANCESTOR_SELECTOR = 'header, nav, footer, #header, #footer, .header, .footer, .gnav, .global-nav';
-
-  const log = (...a) => console.log('[caferun-kawaiine]', ...a);
-
-  function closeTab() {
-    log('タブを閉じます');
-    window.close();
-  }
-
-  // ---- 連続実行モード（タブ間で共有するフラグ）----
-  function chainActive() {
-    const t = Number(GM_getValue(CHAIN_KEY, 0));
-    return t > 0 && Date.now() - t < CHAIN_TTL_MS;
-  }
-  function startChain() { GM_setValue(CHAIN_KEY, Date.now()); }
-  function stopChain(reason) {
-    GM_deleteValue(CHAIN_KEY);
-    log('連続実行を停止:', reason);
-  }
-
-  // クリック直後にページ遷移/再読み込みが起きた場合は、再クリックせず閉じるだけ（同じタブ内での無限ループ防止）
-  const lastClick = Number(sessionStorage.getItem(RELOAD_KEY) || 0);
-  if (lastClick && Date.now() - lastClick < RELOAD_GUARD_MS) {
-    sessionStorage.removeItem(RELOAD_KEY);
-    log('クリック直後の再読み込み。再クリックせず閉じます');
-    setTimeout(closeTab, CLOSE_DELAY_MS);
-    return;
-  }
-
-  // ---- ボタン検出 ----
-  function isVisible(el) {
-    const r  = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
-  }
-
-  function isDisabled(el) {
-    return el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled');
-  }
-
-  function labelOf(el) {
-    if (el instanceof HTMLInputElement) return (el.value || '').replace(/\s+/g, '');
-    let text = (el.textContent || '').replace(/\s+/g, '');
-    if (!text) {
-      const img = el.querySelector('img[alt]');
-      text = (el.getAttribute('aria-label') || el.getAttribute('title') || (img && img.alt) || '').replace(/\s+/g, '');
+  // ---- タブを開く（Tampermonkey の GM_openInTab、なければ GM.openInTab）----
+  function getOpener() {
+    if (typeof GM_openInTab === 'function') {
+      return (url) => GM_openInTab(url, { active: false, insert: true });
     }
-    return text;
-  }
-
-  function findButtons() {
-    const hits = [];
-    for (const el of document.querySelectorAll(CLICKABLE_SELECTOR)) {
-      if (el.closest(`[${RUNNER_ATTR}]`)) continue;          // 自分が追加した実行ボタンは対象外
-      if (!LABEL_RE.test(labelOf(el))) continue;
-      if (el.closest(EXCLUDE_ANCESTOR_SELECTOR)) continue;
-      if (isDisabled(el) || !isVisible(el)) continue;
-      hits.push(el);
+    if (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') {
+      return (url) => GM.openInTab(url, true); // true = 裏で開く
     }
-    // 親子関係にあるものは最も内側だけ残す（<a> の中の <span> など）
-    return hits.filter(el => !hits.some(other => other !== el && el.contains(other)));
+    return null;
+  }
+  const openTab = getOpener();
+
+  // ---- 保存 ----
+  function loadJob() {
+    try { return JSON.parse(sessionStorage.getItem(JOB_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function saveJob(job) {
+    try { sessionStorage.setItem(JOB_KEY, JSON.stringify(job)); } catch (e) { /* 保存できなくても続ける */ }
+  }
+  function clearJob() {
+    try { sessionStorage.removeItem(JOB_KEY); } catch (e) { /* noop */ }
+  }
+  function getLastTarget() {
+    try {
+      if (typeof GM_getValue === 'function') return Number(GM_getValue(LAST_TARGET_KEY, DEFAULT_TARGET)) || DEFAULT_TARGET;
+      return Number(localStorage.getItem(LAST_TARGET_KEY)) || DEFAULT_TARGET;
+    } catch (e) { return DEFAULT_TARGET; }
+  }
+  function setLastTarget(n) {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(LAST_TARGET_KEY, n);
+      else localStorage.setItem(LAST_TARGET_KEY, String(n));
+    } catch (e) { /* noop */ }
   }
 
-  // ボタンが後から描画される場合に備えて、見つかるまで（上限あり）待つ
-  function waitForButtons(timeoutMs) {
-    return new Promise(resolve => {
-      if (findButtons().length > 0) return resolve(true);
-      const observer = new MutationObserver(() => {
-        if (findButtons().length > 0) { observer.disconnect(); clearTimeout(timer); resolve(true); }
-      });
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-      const timer = setTimeout(() => { observer.disconnect(); resolve(findButtons().length > 0); }, timeoutMs);
-    });
+  // ---- 入力チェック ----
+  function normalizeUrl(value) {
+    try {
+      const u = new URL(String(value || '').trim(), location.href);
+      return u.origin === ORIGIN ? u.href : null; // カフェるん以外のページは複製しない
+    } catch (e) { return null; }
+  }
+  function batchesFor(target) { return Math.ceil(target / BATCH_SIZE); }
+
+  // ---- 複製の進行 ----
+  let busy = false;
+  let ticker = null;      // 1秒ごとの表示更新
+  let wakeTimer = null;   // 次の回の時刻ちょうどに起こすタイマー
+  let lastMessage = '';   // 完了・停止・エラーのお知らせ
+
+  function startTicking() {
+    if (!ticker) ticker = setInterval(tick, 1000);
+  }
+  function stopTicking() {
+    if (ticker) { clearInterval(ticker); ticker = null; }
+    if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
+  }
+  function scheduleWake(job) {
+    if (wakeTimer) clearTimeout(wakeTimer);
+    wakeTimer = setTimeout(() => { wakeTimer = null; tick(); }, Math.max(0, job.nextAt - Date.now()));
   }
 
-  function clickTarget(el) {
-    const clickable = el.closest('button, a, input, [role="button"], [onclick]') || el;
-    clickable.click();
-    return clickable;
-  }
-
-  // ---- 実行処理 ----
-  let running = false;
-  function run(opts) {
-    const auto = !!(opts && opts.auto);
-    if (running) return;
-    const targets = findButtons();
-    if (targets.length === 0) {
-      if (auto || chainActive()) {
-        stopChain('「カワいいね!」ボタンを検知できないタブに到達');
-        setRunnerText('カワいいね! 未検知 → 連続実行を終了しました', true);
-      } else {
-        setRunnerText('カワいいね! ボタンが見つかりません', true);
+  async function openBatch(job) {
+    busy = true;
+    try {
+      const n = Math.min(BATCH_SIZE, job.target - job.opened);
+      job.nextAt = Date.now() + BATCH_GAP_MS;   // 次の回は、この回を始めてから1分後
+      job.round = (job.round || 0) + 1;
+      saveJob(job);
+      log(`${job.round}回目: ${n}タブ開きます（${job.opened}/${job.target}）`);
+      for (let i = 0; i < n; i++) {
+        const cur = loadJob();
+        if (!cur || cur.id !== job.id) return;  // 途中で停止された
+        openTab(cur.url);
+        cur.opened += 1;
+        saveJob(cur);
+        job = cur;
+        render();
+        if (i < n - 1) await sleep(OPEN_GAP_MS);
       }
-      log('「カワいいね!」ボタンが見つかりませんでした。このタブは閉じません');
+      if (job.opened >= job.target) finish(job);
+      else scheduleWake(job);
+    } catch (e) {
+      log('タブを開けませんでした', e);
+      clearJob();
+      stopTicking();
+      lastMessage = `タブを開けませんでした（${job.opened}/${job.target}で停止）`;
+    } finally {
+      busy = false;
+      render();
+    }
+  }
+
+  function finish(job) {
+    clearJob();
+    stopTicking();
+    lastMessage = `完了：${job.target}タブ開きました`;
+    log(lastMessage);
+  }
+
+  function tick() {
+    const job = loadJob();
+    if (!job) { stopTicking(); render(); return; }
+    // 画面に出ているときだけ開く（ほかのタブやロック中に勝手に開かない。戻ってきたら続きから）
+    if (!busy && document.visibilityState === 'visible' && Date.now() >= job.nextAt && job.opened < job.target) {
+      openBatch(job);
+    }
+    render();
+  }
+
+  function start() {
+    if (!openTab) {
+      lastMessage = 'このアプリではタブを開けません（Tampermonkeyで入れてください）';
+      render();
       return;
     }
-    running = true;
-    if (!auto) startChain();                               // 実行ボタンから始めたときだけ連続実行モードを開始
-    sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
-    log(`${auto ? '自動' : '手動'}実行: 対象 ${targets.length} 件`, targets);
-    setRunnerText(`実行中… 0/${targets.length}`, true);
-    targets.forEach((b, i) => {
-      setTimeout(() => {
-        const t = clickTarget(b);
-        log(`クリック ${i + 1}/${targets.length}:`, labelOf(t), t);
-        setRunnerText(`実行中… ${i + 1}/${targets.length}`, true);
-      }, i * CLICK_INTERVAL_MS);
-    });
-    const closeAt = (targets.length - 1) * CLICK_INTERVAL_MS + CLOSE_DELAY_MS;
-    setTimeout(() => setRunnerText('完了。閉じて次のタブへ', true), closeAt - CLOSE_DELAY_MS);
-    setTimeout(closeTab, closeAt);
-  }
-
-  // 連続実行モード中にこのタブが「表示状態」になったら自動実行（前のタブが閉じて、このタブが前面に来たとき）
-  let autoTriggered = false;
-  function maybeAutoRun(trigger) {
-    if (autoTriggered || running) return;
-    if (document.visibilityState !== 'visible') return;
-    if (!chainActive()) return;
-    autoTriggered = true;
-    log('連続実行モード: 自動開始 (' + trigger + ')');
-    setRunnerText('連続実行中… ボタンを検出しています', true);
-    waitForButtons(FIND_TIMEOUT_MS).then(found => {
-      if (found) run({ auto: true });
-      else {
-        stopChain('「カワいいね!」ボタンを検知できないタブに到達');
-        setRunnerText('カワいいね! 未検知 → 連続実行を終了しました', true);
-      }
-    });
-  }
-
-  // ---- 画面左下の実行ボタン ----
-  let runner = null;
-  function setRunnerText(text, disabled) {
-    if (!runner) return;
-    runner.style.display = '';
-    runner.textContent = text;
-    runner.disabled = !!disabled;
-    runner.style.opacity = disabled ? '0.7' : '1';
-    runner.style.cursor  = disabled ? 'default' : 'pointer';
-  }
-
-  function refreshRunnerCount() {
-    if (!runner || running || autoTriggered || runner.disabled) return;
-    const n = findButtons().length;
-    if (n === 0) { runner.style.display = 'none'; return; }   // 「カワいいね!」が無いページでは実行ボタンを出さない
-    setRunnerText(`▶ カワいいね! 実行（${n}件）→ 閉じて次のタブへ`, false);
-  }
-
-  function createRunner() {
-    runner = document.createElement('button');
-    runner.type = 'button';
-    runner.setAttribute(RUNNER_ATTR, '1');
-    runner.title = '「カワいいね!」ボタンを順に押して2秒後にこのタブを閉じ、次に表示されたタブでも繰り返します（検知できなくなったら停止）';
-    Object.assign(runner.style, {
-      position: 'fixed',
-      left: '16px',
-      bottom: '16px',
-      zIndex: '2147483647',
-      padding: '12px 18px',
-      fontSize: '15px',
-      fontWeight: 'bold',
-      color: '#fff',
-      background: '#e8609a',
-      border: 'none',
-      borderRadius: '999px',
-      boxShadow: '0 3px 10px rgba(0,0,0,0.25)',
-      cursor: 'pointer',
-    });
-    runner.addEventListener('click', () => run({ auto: false }));
-    document.body.appendChild(runner);
-    refreshRunnerCount();
-    setInterval(refreshRunnerCount, 1000); // 一覧が後から描画された場合に件数を追従
-  }
-
-  function init() {
-    createRunner();
-    maybeAutoRun('load');
-    document.addEventListener('visibilitychange', () => maybeAutoRun('visibilitychange'));
-    window.addEventListener('focus', () => maybeAutoRun('focus'));
-    // 他のタブで連続実行が開始/停止されたら表示を更新
-    if (typeof GM_addValueChangeListener === 'function') {
-      GM_addValueChangeListener(CHAIN_KEY, () => { if (!running && !autoTriggered) refreshRunnerCount(); });
+    if (loadJob()) return; // 実行中
+    const url = normalizeUrl(ui.url.value);
+    if (!url) {
+      lastMessage = 'カフェるん（shop.caferun.jp）のURLを入れてください';
+      render();
+      return;
     }
+    const target = Math.floor(Number(ui.target.value));
+    if (!(target >= 1 && target <= MAX_TARGET)) {
+      lastMessage = `目標タブ数は1〜${MAX_TARGET}で入れてください`;
+      render();
+      return;
+    }
+    setLastTarget(target);
+    lastMessage = '';
+    const job = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      url, target, opened: 0, round: 0, nextAt: 0, startedAt: Date.now(),
+    };
+    saveJob(job);
+    startTicking();
+    tick(); // 1回目はすぐ開く
+  }
+
+  function stop(reason) {
+    const job = loadJob();
+    clearJob();
+    stopTicking();
+    if (job) lastMessage = `停止しました（${job.opened}/${job.target}タブ）`;
+    log('停止:', reason || '');
+    render();
+  }
+
+  // ---- 画面（左下のボタンと設定パネル）----
+  const ui = {};
+
+  const CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; }
+    .pill {
+      position: fixed; left: 12px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); z-index: 2147482995;
+      padding: 10px 16px; border: none; border-radius: 999px; background: #e8609a; color: #fff;
+      font-size: 14px; font-weight: 700; box-shadow: 0 3px 10px rgba(0,0,0,.25); cursor: pointer;
+    }
+    .pill.run { background: #c2185b; }
+    .panel {
+      position: fixed; left: 10px; bottom: calc(64px + env(safe-area-inset-bottom, 0px)); z-index: 2147482999;
+      width: min(340px, calc(100vw - 20px)); padding: 14px; border-radius: 16px;
+      background: #fff; color: #222; box-shadow: 0 8px 30px rgba(0,0,0,.3); display: none;
+    }
+    .panel.open { display: block; }
+    .hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .hd b { font-size: 16px; }
+    .x { border: none; background: transparent; font-size: 20px; color: #888; cursor: pointer; padding: 0 4px; }
+    label { display: block; font-size: 12px; color: #666; margin: 8px 0 4px; }
+    input { width: 100%; font-size: 16px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 10px; color: #222; background: #fff; }
+    input:disabled { background: #f3f3f3; color: #888; }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .row input { width: 110px; }
+    .row span { font-size: 14px; }
+    .hint { font-size: 12px; color: #666; margin-top: 6px; line-height: 1.5; }
+    .btn { width: 100%; margin-top: 12px; padding: 11px; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; color: #fff; cursor: pointer; }
+    .go { background: #e8609a; }
+    .stop { background: #555; }
+    .bar { height: 8px; border-radius: 4px; background: #eee; overflow: hidden; margin-top: 10px; }
+    .bar i { display: block; height: 100%; width: 0; background: #e8609a; transition: width .3s; }
+    .st { font-size: 14px; margin-top: 8px; line-height: 1.5; }
+    .msg { font-size: 13px; margin-top: 8px; color: #c2185b; min-height: 1em; }
+    .v { font-size: 10px; color: #aaa; margin-top: 8px; text-align: right; }
+  `;
+
+  function buildUI() {
+    const host = document.createElement('div');
+    host.setAttribute('data-kt3dup', '1');
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `
+      <style>${CSS}</style>
+      <button class="pill" type="button">⧉ タブ複製</button>
+      <div class="panel" role="dialog" aria-label="タブ複製">
+        <div class="hd"><b>タブ複製</b><button class="x" type="button" aria-label="閉じる">×</button></div>
+        <label>複製するページ</label>
+        <input class="url" type="url" inputmode="url" autocomplete="off">
+        <label>目標タブ数（新しく開く数）</label>
+        <div class="row"><input class="target" type="number" min="1" max="${MAX_TARGET}" step="1" inputmode="numeric"><span>タブ</span></div>
+        <div class="hint plan"></div>
+        <button class="btn go" type="button">開始</button>
+        <button class="btn stop" type="button" style="display:none">停止</button>
+        <div class="bar"><i></i></div>
+        <div class="st"></div>
+        <div class="msg"></div>
+        <div class="hint">画面がロックされたり、ほかのタブに移ったりすると一時停止します。このタブに戻ると続きから開きます。</div>
+        <div class="v">v${(typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || ''}</div>
+      </div>`;
+    document.body.appendChild(host);
+    const $ = (s) => root.querySelector(s);
+    Object.assign(ui, {
+      host, pill: $('.pill'), panel: $('.panel'), close: $('.x'), url: $('.url'), target: $('.target'),
+      plan: $('.plan'), go: $('.go'), stop: $('.stop'), bar: $('.bar i'), st: $('.st'), msg: $('.msg'),
+    });
+    ui.url.value = location.href;
+    ui.target.value = String(getLastTarget());
+    ui.pill.addEventListener('click', () => { ui.panel.classList.toggle('open'); render(); });
+    ui.close.addEventListener('click', () => { ui.panel.classList.remove('open'); render(); });
+    ui.go.addEventListener('click', start);
+    ui.stop.addEventListener('click', () => stop('停止ボタン'));
+    ui.target.addEventListener('input', render);
+  }
+
+  function fmtLeft(ms) {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  function render() {
+    if (!ui.pill) return;
+    const job = loadJob();
+    const running = !!job;
+
+    ui.pill.textContent = running ? `⧉ ${job.opened}/${job.target}` : '⧉ タブ複製';
+    ui.pill.classList.toggle('run', running);
+    ui.url.disabled = running;
+    ui.target.disabled = running;
+    ui.go.style.display = running ? 'none' : '';
+    ui.stop.style.display = running ? '' : 'none';
+
+    const t = running ? job.target : Math.floor(Number(ui.target.value));
+    if (t >= 1 && t <= MAX_TARGET) {
+      const b = batchesFor(t);
+      ui.plan.textContent = `${BATCH_SIZE}タブずつ・1分おき → 全部で${b}回・約${b - 1}分`;
+    } else {
+      ui.plan.textContent = `1〜${MAX_TARGET}で入れてください`;
+    }
+
+    if (running) {
+      ui.bar.style.width = `${Math.round((job.opened / job.target) * 100)}%`;
+      let line = `${job.opened} / ${job.target} タブ開きました`;
+      if (busy) line += '（開いています…）';
+      else if (job.opened < job.target) {
+        line += document.visibilityState === 'visible'
+          ? `／次の${Math.min(BATCH_SIZE, job.target - job.opened)}タブまで ${fmtLeft(job.nextAt - Date.now())}`
+          : '／一時停止中';
+      }
+      ui.st.textContent = line;
+    } else {
+      ui.bar.style.width = '0';
+      ui.st.textContent = '';
+    }
+    ui.msg.textContent = lastMessage;
+  }
+
+  // ---- 起動 ----
+  function init() {
+    buildUI();
+    const resumed = loadJob();
+    if (resumed) {             // 再読み込み前の続き
+      ui.panel.classList.add('open');
+      startTicking();
+      scheduleWake(resumed);
+      tick();
+    }
+    render();
+    document.addEventListener('visibilitychange', () => { if (loadJob()) tick(); else render(); });
   }
 
   if (document.body) init();
@@ -241,11 +320,7 @@
 
   // Tampermonkey のアイコンメニュー
   if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('カワいいね! を実行して閉じる（連続実行開始）', () => run({ auto: false }));
-    GM_registerMenuCommand('連続実行を停止', () => {
-      stopChain('メニューから停止');
-      autoTriggered = false;
-      if (!running) setRunnerText('連続実行を停止しました', true);
-    });
+    GM_registerMenuCommand('タブ複製パネルを開く', () => { if (ui.panel) { ui.panel.classList.add('open'); render(); } });
+    GM_registerMenuCommand('複製を停止', () => stop('メニュー'));
   }
 })();
